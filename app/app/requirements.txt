@@ -1,0 +1,9 @@
+scrapling[fetchers]>=0.4.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+tldextract>=5.1.2
+python-dotenv>=1.0.1
+patchright>=1.62.0
+browserforge>=1.2.4
+

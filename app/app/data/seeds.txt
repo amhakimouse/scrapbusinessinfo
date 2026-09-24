@@ -1,0 +1,6 @@
+# One Amazon-affiliate site URL per line. Lines starting with # are ignored.
+# Replace these with real sites you've identified.
+https://thesommerhome.com/16-of-the-best-kitchen-gadgets-from-amazon/
+https://skinsort.com/
+https://skinskoolbeauty.com/
+
