@@ -20,6 +20,7 @@ and product review content — NOT affiliate program directories, network
 landing pages, or brand partnership signup pages.
 """
 import random
+import threading
 import time
 from urllib.parse import quote_plus
 
@@ -27,6 +28,37 @@ from scrapling.fetchers import Fetcher
 
 import config
 from scraper.utils import get_domain
+
+_SEARCH_LOCK = threading.Lock()
+_LAST_SEARCH_TIME = 0.0
+_MIN_SEARCH_INTERVAL = 0.8  # seconds between DuckDuckGo search requests to prevent anti-bot throttle
+
+
+def _rate_limited_ddg_post(url: str, data: dict):
+    global _LAST_SEARCH_TIME
+    with _SEARCH_LOCK:
+        now = time.time()
+        elapsed = now - _LAST_SEARCH_TIME
+        if elapsed < _MIN_SEARCH_INTERVAL:
+            time.sleep(_MIN_SEARCH_INTERVAL - elapsed)
+        try:
+            return Fetcher.post(url, data=data, stealthy_headers=True)
+        finally:
+            _LAST_SEARCH_TIME = time.time()
+
+
+def _rate_limited_ddg_get(url: str):
+    global _LAST_SEARCH_TIME
+    with _SEARCH_LOCK:
+        now = time.time()
+        elapsed = now - _LAST_SEARCH_TIME
+        if elapsed < _MIN_SEARCH_INTERVAL:
+            time.sleep(_MIN_SEARCH_INTERVAL - elapsed)
+        try:
+            return Fetcher.get(url, stealthy_headers=True)
+        finally:
+            _LAST_SEARCH_TIME = time.time()
+
 
 # Domains to exclude from discovered affiliate leads:
 # search engines, social platforms, affiliate networks/directories,
@@ -193,11 +225,11 @@ def search_candidate_urls(
     search_url = "https://lite.duckduckgo.com/lite/"
 
     try:
-        page = Fetcher.post(search_url, data={"q": keyword}, stealthy_headers=True)
+        page = _rate_limited_ddg_post(search_url, data={"q": keyword})
     except Exception:
         try:
             get_url = f"https://html.duckduckgo.com/html/?q={quote_plus(keyword)}"
-            page = Fetcher.get(get_url, stealthy_headers=True)
+            page = _rate_limited_ddg_get(get_url)
         except Exception:
             return []
 
@@ -219,7 +251,7 @@ def search_candidate_urls(
         time.sleep(config.REQUEST_DELAY + random.uniform(0.3, 0.8))
 
         try:
-            page = Fetcher.post(search_url, data=next_form, stealthy_headers=True)
+            page = _rate_limited_ddg_post(search_url, data=next_form)
         except Exception:
             break
 
@@ -266,12 +298,8 @@ def discover_by_niche(
         f"best {cleaned_kw} tested recommended blog",
     ]
 
-    from scraper.store import load_leads
-
-    known_domains = {l.domain.lower() for l in load_leads() if l.domain}
-
     discovered_urls: list[str] = []
-    seen_domains = set(known_domains) | EXCLUDED_DISCOVERY_DOMAINS
+    seen_domains = set(EXCLUDED_DISCOVERY_DOMAINS)
 
     for query in queries:
         if limit and len(discovered_urls) >= limit:
@@ -296,6 +324,30 @@ def discover_by_niche(
             if limit and len(discovered_urls) >= limit:
                 return discovered_urls
 
+    # Graceful fallback: if start_page > 1 returned 0 candidates, search from page 1
+    if not discovered_urls and start_page and start_page > 1:
+        for query in queries:
+            if limit and len(discovered_urls) >= limit:
+                break
+            remaining = (limit - len(discovered_urls)) if limit else None
+            per_query_limit = (remaining * 3) if remaining else None
+            urls = search_candidate_urls(query, limit=per_query_limit, start_page=1)
+            for url in urls:
+                domain = get_domain(url).lower()
+                if not domain or domain in seen_domains:
+                    continue
+                if _is_program_page(url):
+                    continue
+                if _is_large_publisher(domain):
+                    continue
+                seen_domains.add(domain)
+                discovered_urls.append(url)
+                if progress_cb:
+                    progress_cb(url, domain)
+                if limit and len(discovered_urls) >= limit:
+                    return discovered_urls
+
     return discovered_urls
+
 
 

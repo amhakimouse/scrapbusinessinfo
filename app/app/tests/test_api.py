@@ -127,6 +127,83 @@ async def test_api_discover_stream(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_api_bulk_discover(monkeypatch, tmp_path):
+    leads_file = tmp_path / "leads.json"
+    monkeypatch.setattr(config, "LEADS_FILE", leads_file)
+
+    def mock_discover(kw, limit=20, start_page=3):
+        return [f"https://{kw}-site.com/gadgets"]
+
+    def mock_extract(url, source_keyword=None, mode=None):
+        return Lead(
+            domain=url.replace("https://", "").replace("/gadgets", ""),
+            url=url,
+            business_name=f"{source_keyword} Blog",
+            emails=[f"contact@{source_keyword}.com"],
+            source_keyword=source_keyword,
+        )
+
+    monkeypatch.setattr("api.discover_by_niche", mock_discover)
+    monkeypatch.setattr("api.extract_lead", mock_extract)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        # Empty keywords should fail
+        res_empty = await ac.post("/api/discover/bulk", json={"keywords": []})
+        assert res_empty.status_code == 422 or res_empty.status_code == 400
+
+        # Valid bulk discovery
+        res = await ac.post("/api/discover/bulk", json={"keywords": ["coffee", "kitchen"], "max_workers": 8})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["total_niches"] == 2
+        assert data["total_scraped"] == 2
+        assert data["total_with_email"] == 2
+        assert len(data["leads"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_api_bulk_discover_stream(monkeypatch, tmp_path):
+    import json
+    leads_file = tmp_path / "leads.json"
+    monkeypatch.setattr(config, "LEADS_FILE", leads_file)
+
+    def mock_discover(kw, limit=20, start_page=3):
+        return [f"https://{kw}-blog.com/review"]
+
+    def mock_extract(url, source_keyword=None, mode=None):
+        return Lead(
+            domain=url.replace("https://", "").replace("/review", ""),
+            url=url,
+            business_name=f"{source_keyword} Site",
+            emails=[f"info@{source_keyword}.com"],
+            source_keyword=source_keyword,
+        )
+
+    monkeypatch.setattr("api.discover_by_niche", mock_discover)
+    monkeypatch.setattr("api.extract_lead", mock_extract)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        res = await ac.get("/api/discover/bulk/stream?keywords=coffee,tea&max_workers=8")
+        assert res.status_code == 200
+        assert "text/event-stream" in res.headers["content-type"]
+
+        events = []
+        for line in res.text.splitlines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+
+        types = [e["type"] for e in events]
+        assert "bulk_start" in types
+        assert "niche_start" in types
+        assert "bulk_done" in types
+
+        bulk_done = next(e for e in events if e["type"] == "bulk_done")
+        assert bulk_done["total_niches"] == 2
+        assert bulk_done["total_scraped"] == 2
+        assert bulk_done["total_with_email"] == 2
+
+
+@pytest.mark.asyncio
 async def test_api_delete_leads(tmp_path, monkeypatch):
     leads_file = tmp_path / "leads.json"
     monkeypatch.setattr(config, "LEADS_FILE", leads_file)
@@ -157,4 +234,6 @@ async def test_api_delete_leads(tmp_path, monkeypatch):
         assert data_all["deleted_count"] == 1
         assert data_all["remaining_count"] == 0
         assert len(data_all["leads"]) == 0
+
+
 

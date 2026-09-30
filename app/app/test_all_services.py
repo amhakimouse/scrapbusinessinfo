@@ -133,6 +133,13 @@ def run_api_tests():
         print(f"  ✓ POST /api/discover: discovered {disco.get('discovered_urls_count')} URLs, scraped {disco.get('scraped_count')} leads")
         assert r_disco.status_code == 200
 
+        # Test POST /api/discover/bulk
+        r_bulk = httpx.post(f"{base_url}/api/discover/bulk", json={"keywords": ["espresso gear", "coffee roaster"], "limit": 1, "max_workers": 8}, timeout=60.0)
+        bulk_data = r_bulk.json()
+        print(f"  ✓ POST /api/discover/bulk: processed {bulk_data.get('total_niches')} niches across 8 workers, total scraped: {bulk_data.get('total_scraped')}")
+        assert r_bulk.status_code == 200
+        assert bulk_data.get("total_niches") == 2
+
         print("\n[PASS] All FastAPI live endpoints passed!")
         return True
 

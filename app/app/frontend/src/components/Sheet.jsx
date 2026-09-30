@@ -4,11 +4,9 @@ const COLUMNS = [
   "Business",
   "Website",
   "Email(s)",
-  "Phone(s)",
   "Social",
   "About",
-  "Affiliate signal",
-  "Source keyword",
+  "Source Keyword",
   "Status",
 ];
 
@@ -20,10 +18,8 @@ function rowToArray(lead) {
     lead.business_name || "",
     lead.url || "",
     (lead.emails || []).join("; "),
-    (lead.phones || []).join("; "),
     social,
     lead.about_snippet || "",
-    lead.niche_signal || "",
     lead.source_keyword || "",
     lead.status || "",
   ];
@@ -36,22 +32,30 @@ function buildTSV(leads) {
 
 export default function Sheet({ leads, onlyWithEmail, selectedNiche, onShowAll }) {
   const [copied, setCopied] = useState(false);
+  const [copiedEmail, setCopiedEmail] = useState(null);
 
   const handleCopy = async () => {
     const tsv = buildTSV(leads);
     await navigator.clipboard.writeText(tsv);
     setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setTimeout(() => setCopied(false), 2200);
+  };
+
+  const handleCopySingleEmail = async (email, e) => {
+    e.stopPropagation();
+    await navigator.clipboard.writeText(email);
+    setCopiedEmail(email);
+    setTimeout(() => setCopiedEmail(null), 1800);
   };
 
   const handleDownloadCSV = () => {
     const csv = [COLUMNS, ...leads.map(rowToArray)]
       .map((r) => r.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(","))
       .join("\n");
-    const blob = new Blob([csv], { type: "text/csv" });
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "leads.csv";
+    link.download = `leads-${(selectedNiche || "all").toLowerCase().replace(/[^a-z0-9]+/g, "-")}.csv`;
     link.click();
   };
 
@@ -60,15 +64,16 @@ export default function Sheet({ leads, onlyWithEmail, selectedNiche, onShowAll }
       return (
         <div className="sheet-wrap">
           <div className="empty-state">
-            <h2 style={{ margin: 0 }}>No businesses with email found</h2>
-            <p style={{ maxWidth: 540, lineHeight: 1.6, margin: "12px auto" }}>
-              There are currently no leads with verified email addresses
+            <div className="empty-icon">✉️</div>
+            <h2>No verified email leads found</h2>
+            <p>
+              There are currently no leads with email addresses
               {selectedNiche && selectedNiche !== "ALL" ? ` in "${selectedNiche}"` : ""}.
             </p>
-            <div style={{ marginTop: 16, display: "flex", gap: 10, justifyContent: "center" }}>
+            <div style={{ marginTop: 18, display: "flex", gap: 10, justifyContent: "center" }}>
               {onShowAll && (
-                <button type="button" className="btn" onClick={onShowAll}>
-                  Show all sites in this view (including without email)
+                <button type="button" className="btn primary" onClick={onShowAll}>
+                  Show all discovered sites ({selectedNiche})
                 </button>
               )}
             </div>
@@ -80,20 +85,10 @@ export default function Sheet({ leads, onlyWithEmail, selectedNiche, onShowAll }
     return (
       <div className="sheet-wrap">
         <div className="empty-state">
-          <h2 style={{ margin: 0 }}>No leads yet</h2>
-          <p style={{ maxWidth: 540, lineHeight: 1.6, margin: "12px auto" }}>
-            To populate leads, add URLs to <code>data/seeds.txt</code> and run:
-            <br />
-            <code style={{ display: "inline-block", margin: "6px 0", padding: "4px 8px", background: "var(--bg-card, #f4f4f5)", borderRadius: 4 }}>
-              python main.py
-            </code>
-            <br />
-            <span style={{ fontSize: "0.9em", color: "var(--ink-text-dim, #666)" }}>
-              <em>Note:</em> Editing <code>seeds.txt</code> alone does not scrape sites. Once the CLI run completes, click <strong>Refresh</strong> or reload your browser.
-            </span>
-          </p>
-          <p style={{ fontSize: "0.9em", color: "var(--ink-text-dim, #666)" }}>
-            You can also discover affiliate marketer blogs automatically using the niche keyword search bar above.
+          <div className="empty-icon">🔍</div>
+          <h2>No leads in database yet</h2>
+          <p>
+            Use <strong>Single Niche</strong> or <strong>⚡ Bulk Discover</strong> above to search DuckDuckGo and automatically discover and extract small business leads.
           </p>
         </div>
       </div>
@@ -102,14 +97,25 @@ export default function Sheet({ leads, onlyWithEmail, selectedNiche, onShowAll }
 
   return (
     <>
-      <div className="button-row" style={{ marginBottom: 10, justifyContent: "flex-end" }}>
-        {copied && <span className="copy-confirm">Copied {leads.length} rows</span>}
-        <button className="btn" onClick={handleDownloadCSV}>
-          Download CSV
-        </button>
-        <button className="btn primary" onClick={handleCopy}>
-          Copy sheet
-        </button>
+      <div className="sheet-top-bar">
+        <div className="sheet-meta">
+          <span className="sheet-meta-pill">
+            <strong>{leads.length}</strong> {leads.length === 1 ? "entry" : "entries"}
+          </span>
+          <span className="sheet-meta-pill highlight">
+            <strong>{leads.filter((l) => l.emails && l.emails.length > 0).length}</strong> with email
+          </span>
+        </div>
+        <div className="button-row">
+          {copied && <span className="copy-confirm">✓ Copied {leads.length} rows to clipboard</span>}
+          {copiedEmail && <span className="copy-confirm">✓ Copied {copiedEmail}</span>}
+          <button className="btn" onClick={handleDownloadCSV} title="Download current sheet as CSV">
+            <span className="btn-icon">📥</span> Download CSV
+          </button>
+          <button className="btn primary" onClick={handleCopy} title="Copy table to paste directly into Google Sheets or Excel">
+            <span className="btn-icon">📋</span> Copy Sheet
+          </button>
+        </div>
       </div>
 
       <div className="sheet-wrap">
@@ -125,42 +131,65 @@ export default function Sheet({ leads, onlyWithEmail, selectedNiche, onShowAll }
             <tbody>
               {leads.map((lead) => (
                 <tr key={lead.domain}>
-                  <td className="business">{lead.business_name || "—"}</td>
+                  <td className="business">
+                    <div className="business-title">{lead.business_name || lead.domain}</div>
+                    <div className="domain-subtext">{lead.domain}</div>
+                  </td>
                   <td className="url">
-                    <a href={lead.url} target="_blank" rel="noreferrer">
-                      {lead.domain}
+                    <a href={lead.url} target="_blank" rel="noreferrer" className="site-link">
+                      {lead.domain} <span className="ext-icon">↗</span>
                     </a>
                   </td>
-                  <td>
+                  <td className="emails-col">
                     <div className="email-list">
-                      {(lead.emails || []).length > 0
-                        ? lead.emails.map((e) => <span key={e}>{e}</span>)
-                        : "—"}
+                      {(lead.emails || []).length > 0 ? (
+                        lead.emails.map((e) => (
+                          <button
+                            key={e}
+                            type="button"
+                            className="email-chip"
+                            title="Click to copy email address"
+                            onClick={(ev) => handleCopySingleEmail(e, ev)}
+                          >
+                            <span className="mail-icon">✉</span>
+                            <span className="mail-text">{e}</span>
+                          </button>
+                        ))
+                      ) : (
+                        <span className="no-data">—</span>
+                      )}
                     </div>
                   </td>
-                  <td>{(lead.phones || []).join(", ") || "—"}</td>
                   <td className="social">
-                    {Object.entries(lead.social_links || {}).map(([label, url]) => (
-                      <div key={label}>
-                        <a href={url} target="_blank" rel="noreferrer">
+                    <div className="social-links-wrap">
+                      {Object.entries(lead.social_links || {}).map(([label, url]) => (
+                        <a key={label} href={url} target="_blank" rel="noreferrer" className="social-badge">
                           {label}
                         </a>
-                      </div>
-                    ))}
-                    {Object.keys(lead.social_links || {}).length === 0 && "—"}
+                      ))}
+                      {Object.keys(lead.social_links || {}).length === 0 && <span className="no-data">—</span>}
+                    </div>
                   </td>
-                  <td style={{ maxWidth: 200, fontSize: "0.8rem" }}>
-                    {lead.about_snippet
-                      ? lead.about_snippet.length > 120
-                        ? lead.about_snippet.slice(0, 120) + "…"
-                        : lead.about_snippet
-                      : "—"}
+                  <td className="about-col">
+                    {lead.about_snippet ? (
+                      <p className="about-text" title={lead.about_snippet}>
+                        {lead.about_snippet}
+                      </p>
+                    ) : (
+                      <span className="no-data">—</span>
+                    )}
                   </td>
-                  <td style={{ maxWidth: 220 }}>{lead.niche_signal || "—"}</td>
-                  <td>{lead.source_keyword || "—"}</td>
-                  <td>
+                  <td className="niche-col">
+                    {lead.source_keyword ? (
+                      <span className="niche-pill">{lead.source_keyword}</span>
+                    ) : (
+                      <span className="niche-pill seed">Seed List</span>
+                    )}
+                  </td>
+                  <td className="status-col">
                     <span className={`badge ${lead.emails?.length ? "has-email" : "no-email"}`}>
-                      {lead.emails?.length ? "has email" : "no email"}
+                      <span className="badge-dot" />
+                      {lead.emails?.length ? "Verified Email" : "No Direct Email"}
                     </span>
                   </td>
                 </tr>
@@ -172,3 +201,4 @@ export default function Sheet({ leads, onlyWithEmail, selectedNiche, onShowAll }
     </>
   );
 }
+

@@ -3,16 +3,21 @@
 Run with:  uvicorn api:app --reload --port 8000
 Then the React dev server (npm run dev) talks to it on localhost:8000.
 """
+import asyncio
 import json
-from fastapi import FastAPI, HTTPException
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import config
 from scraper.discovery import load_seed_urls, discover_by_niche
 from scraper.extractor import extract_lead, ExtractionError
 from scraper.store import load_leads, upsert_lead, delete_leads
+from scraper.utils import get_domain
 
 app = FastAPI(title="Affiliate Marketer Leads API")
 
@@ -31,6 +36,119 @@ class DiscoverRequest(BaseModel):
     limit: int = 20
     start_page: int = 3  # skip pages 1 and 2 (big-brand results) by default
     has_email_only: bool = True
+
+
+class BulkDiscoverRequest(BaseModel):
+    keywords: list[str] = Field(..., min_length=1)
+    mode: str = "fast"
+    limit: int = 50
+    start_page: int = 3
+    has_email_only: bool = True
+    max_workers: int = 8
+
+
+def _clean_keywords_list(keywords_input: list[str] | str) -> list[str]:
+    import re
+    raw_list = []
+    if isinstance(keywords_input, list):
+        raw_list = keywords_input
+    elif isinstance(keywords_input, str):
+        trimmed = keywords_input.strip()
+        if trimmed.startswith("[") and trimmed.endswith("]"):
+            try:
+                parsed = json.loads(trimmed)
+                if isinstance(parsed, list):
+                    raw_list = parsed
+            except Exception:
+                pass
+        if not raw_list:
+            raw_list = trimmed.replace("\n", ",").split(",")
+
+    cleaned = []
+    seen = set()
+    for item in raw_list:
+        s = str(item).strip().strip('"\'')
+        # Strip leading numbers or bullets like "1. ", "- ", "* ", "• "
+        s = re.sub(r'^\s*[\d\.\-\*\•\)]+\s*', '', s).strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            cleaned.append(s)
+    return cleaned
+
+
+def _scrape_niche_worker(
+    kw: str,
+    limit: int,
+    start_page: int,
+    mode: str,
+    has_email_only: bool,
+    emit_fn=None,
+):
+    """Worker function to discover & scrape leads for a single niche."""
+    def emit(event_type: str, **kwargs):
+        if emit_fn:
+            emit_fn(event_type, keyword=kw, **kwargs)
+
+    emit("niche_start", message=f"Starting discovery for '{kw}'...")
+    emit("searching", message=f"Searching DuckDuckGo for \"{kw}\" (starting page {start_page})...", start_page=start_page)
+
+    candidate_limit = limit * 3 if has_email_only else limit
+    try:
+        discovered_urls = discover_by_niche(kw, limit=candidate_limit, start_page=start_page)
+    except Exception as e:
+        emit("niche_error", message=f"Discovery failed for {kw}: {e}")
+        discovered_urls = []
+
+    emit("discovery_done", total_candidates=len(discovered_urls))
+
+    if not discovered_urls:
+        emit("niche_done", scraped=0, with_email=0, total_candidates=0, message=f"No new candidates found for '{kw}'.")
+        return {"keyword": kw, "scraped": 0, "with_email": 0, "candidates": 0}
+
+    emit("start_scraping", total=len(discovered_urls))
+
+    new_leads = []
+    leads_with_email = []
+
+    for i, url in enumerate(discovered_urls, start=1):
+        domain = get_domain(url)
+        emit("scraping", url=url, domain=domain, index=i, total=len(discovered_urls))
+        try:
+            lead = extract_lead(url, source_keyword=kw, mode=mode)
+            upsert_lead(lead)
+            new_leads.append(lead)
+            has_email = bool(lead.emails)
+            if has_email:
+                leads_with_email.append(lead)
+
+            emit(
+                "lead_saved",
+                domain=lead.domain,
+                business_name=lead.business_name or lead.domain,
+                emails=lead.emails or [],
+                has_email=has_email,
+                email_count=len(lead.emails or []),
+                total_with_email=len(leads_with_email),
+                scraped_count=len(new_leads),
+                total=len(discovered_urls),
+            )
+
+            if has_email_only and len(leads_with_email) >= limit:
+                break
+            elif not has_email_only and len(new_leads) >= limit:
+                break
+        except ExtractionError as e:
+            emit("lead_skipped", url=url, domain=domain, reason=str(e), scraped_count=len(new_leads), total=len(discovered_urls))
+        except Exception as e:
+            emit("lead_skipped", url=url, domain=domain, reason=f"Unexpected error: {e}", scraped_count=len(new_leads), total=len(discovered_urls))
+
+    emit("niche_done", scraped=len(new_leads), with_email=len(leads_with_email), total_candidates=len(discovered_urls))
+    return {
+        "keyword": kw,
+        "scraped": len(new_leads),
+        "with_email": len(leads_with_email),
+        "candidates": len(discovered_urls),
+    }
 
 
 @app.get("/api/health")
@@ -88,33 +206,60 @@ def discover_leads(req: DiscoverRequest):
     if not kw:
         raise HTTPException(status_code=400, detail="Keyword cannot be empty")
 
-    candidate_limit = req.limit * 3 if req.has_email_only else req.limit
-    discovered_urls = discover_by_niche(kw, limit=candidate_limit, start_page=req.start_page)
-    new_leads = []
-    leads_with_email = []
-
-    for url in discovered_urls:
-        try:
-            lead = extract_lead(url, source_keyword=kw, mode=req.mode)
-            upsert_lead(lead)
-            new_leads.append(lead.model_dump())
-            if lead.emails:
-                leads_with_email.append(lead)
-                if req.has_email_only and len(leads_with_email) >= req.limit:
-                    break
-            elif not req.has_email_only and len(new_leads) >= req.limit:
-                break
-        except ExtractionError:
-            pass
-        except Exception:  # noqa: BLE001
-            pass
-
+    res = _scrape_niche_worker(
+        kw=kw,
+        limit=req.limit,
+        start_page=req.start_page,
+        mode=req.mode,
+        has_email_only=req.has_email_only,
+    )
     current_leads = load_leads()
     return {
         "keyword": kw,
-        "discovered_urls_count": len(discovered_urls),
-        "scraped_count": len(new_leads),
-        "with_email_count": len([l for l in new_leads if l.get("emails")]),
+        "discovered_urls_count": res["candidates"],
+        "scraped_count": res["scraped"],
+        "with_email_count": res["with_email"],
+        "total_leads_count": len(current_leads),
+        "leads": [l.model_dump() for l in current_leads],
+    }
+
+
+@app.post("/api/discover/bulk")
+def discover_leads_bulk(req: BulkDiscoverRequest):
+    """Asynchronously discover & scrape leads for multiple niches in parallel."""
+    clean_kws = _clean_keywords_list(req.keywords)
+    if not clean_kws:
+        raise HTTPException(status_code=400, detail="At least one valid keyword is required")
+
+    workers = min(len(clean_kws), max(1, req.max_workers))
+    results = []
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                _scrape_niche_worker,
+                kw=kw,
+                limit=req.limit,
+                start_page=req.start_page,
+                mode=req.mode,
+                has_email_only=req.has_email_only,
+            )
+            for kw in clean_kws
+        ]
+        for f in futures:
+            try:
+                res = f.result()
+                if res:
+                    results.append(res)
+            except Exception as e:
+                results.append({"keyword": "unknown", "scraped": 0, "with_email": 0, "candidates": 0, "error": str(e)})
+
+    current_leads = load_leads()
+    return {
+        "total_niches": len(clean_kws),
+        "niche_results": results,
+        "total_scraped": sum(r.get("scraped", 0) for r in results),
+        "total_with_email": sum(r.get("with_email", 0) for r in results),
         "total_leads_count": len(current_leads),
         "leads": [l.model_dump() for l in current_leads],
     }
@@ -128,123 +273,49 @@ def discover_stream(
     mode: str = "fast",
     has_email_only: bool = True,
 ):
-    """SSE streaming endpoint for real-time discovery and scraping events."""
+    """SSE streaming endpoint for single keyword discovery and scraping events."""
     kw = keyword.strip()
     if not kw:
         raise HTTPException(status_code=400, detail="Keyword cannot be empty")
 
     def event_stream():
-        def format_event(event_type: str, **kwargs) -> str:
-            payload = json.dumps({"type": event_type, **kwargs})
-            return f"data: {payload}\n\n"
+        event_q = queue.Queue()
 
-        try:
-            yield format_event(
-                "searching",
-                message=f"Searching DuckDuckGo for \"{kw}\" (skipping pages 1 & 2)...",
-                keyword=kw,
-                start_page=start_page,
-            )
+        def emit(event_type: str, **kwargs):
+            event_q.put({"type": event_type, **kwargs})
 
-            candidate_limit = limit * 3 if has_email_only else limit
-            discovered_urls = discover_by_niche(
-                kw,
-                limit=candidate_limit,
-                start_page=start_page,
-            )
-
-            yield format_event(
-                "discovery_done",
-                total_candidates=len(discovered_urls),
-                keyword=kw,
-            )
-
-            if not discovered_urls:
+        def worker():
+            try:
+                res = _scrape_niche_worker(
+                    kw=kw,
+                    limit=limit,
+                    start_page=start_page,
+                    mode=mode,
+                    has_email_only=has_email_only,
+                    emit_fn=emit,
+                )
                 current_leads = load_leads()
-                yield format_event(
+                emit(
                     "done",
                     keyword=kw,
-                    scraped=0,
-                    with_email=0,
+                    scraped=res["scraped"],
+                    with_email=res["with_email"],
                     total_leads=len(current_leads),
                     leads=[l.model_dump() for l in current_leads],
-                    message="No new candidate URLs discovered for this keyword.",
                 )
-                return
+            except Exception as e:
+                emit("error", message=str(e))
+            finally:
+                event_q.put(None)
 
-            yield format_event(
-                "start_scraping",
-                total=len(discovered_urls),
-                keyword=kw,
-            )
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
 
-            new_leads = []
-            leads_with_email = []
-
-            for i, url in enumerate(discovered_urls, start=1):
-                from scraper.utils import get_domain
-                domain = get_domain(url)
-                yield format_event(
-                    "scraping",
-                    url=url,
-                    domain=domain,
-                    index=i,
-                    total=len(discovered_urls),
-                )
-                try:
-                    lead = extract_lead(url, source_keyword=kw, mode=mode)
-                    upsert_lead(lead)
-                    new_leads.append(lead)
-                    has_email = bool(lead.emails)
-                    if has_email:
-                        leads_with_email.append(lead)
-
-                    yield format_event(
-                        "lead_saved",
-                        domain=lead.domain,
-                        business_name=lead.business_name or lead.domain,
-                        emails=lead.emails or [],
-                        has_email=has_email,
-                        email_count=len(lead.emails or []),
-                        total_with_email=len(leads_with_email),
-                        scraped_count=len(new_leads),
-                        total=len(discovered_urls),
-                    )
-
-                    if has_email_only and len(leads_with_email) >= limit:
-                        break
-                    elif not has_email_only and len(new_leads) >= limit:
-                        break
-                except ExtractionError as e:
-                    yield format_event(
-                        "lead_skipped",
-                        url=url,
-                        domain=domain,
-                        reason=str(e),
-                        scraped_count=len(new_leads),
-                        total=len(discovered_urls),
-                    )
-                except Exception as e:
-                    yield format_event(
-                        "lead_skipped",
-                        url=url,
-                        domain=domain,
-                        reason=f"Unexpected error: {e}",
-                        scraped_count=len(new_leads),
-                        total=len(discovered_urls),
-                    )
-
-            current_leads = load_leads()
-            yield format_event(
-                "done",
-                keyword=kw,
-                scraped=len(new_leads),
-                with_email=len(leads_with_email),
-                total_leads=len(current_leads),
-                leads=[l.model_dump() for l in current_leads],
-            )
-        except Exception as e:
-            yield format_event("error", message=str(e))
+        while True:
+            item = event_q.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item)}\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -255,6 +326,98 @@ def discover_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get("/api/discover/bulk/stream")
+def discover_bulk_stream(
+    keywords: str = Query(..., description="Comma or newline separated list of keywords, or JSON array"),
+    limit: int = 50,
+    start_page: int = 3,
+    mode: str = "fast",
+    has_email_only: bool = True,
+    max_workers: int = 8,
+):
+    """SSE streaming endpoint for concurrent multi-niche discovery and extraction."""
+    import random
+    import time
+    clean_kws = _clean_keywords_list(keywords)
+
+    if not clean_kws:
+        raise HTTPException(status_code=400, detail="At least one valid keyword is required")
+
+    def event_stream():
+        event_q = queue.Queue()
+        workers_count = min(len(clean_kws), max(1, max_workers))
+
+        def emit(event_type: str, **kwargs):
+            event_q.put({"type": event_type, **kwargs})
+
+        emit(
+            "bulk_start",
+            total_niches=len(clean_kws),
+            keywords=clean_kws,
+            max_workers=workers_count,
+            message=f"Starting bulk discovery for {len(clean_kws)} niches with {workers_count} parallel workers...",
+        )
+
+        niche_results = []
+        results_lock = threading.Lock()
+
+        def run_all_workers():
+            with ThreadPoolExecutor(max_workers=workers_count) as executor:
+                def task(niche_kw, idx):
+                    # Slight initial jitter so threads stagger initial search engine requests
+                    time.sleep(idx * 0.15)
+                    res = _scrape_niche_worker(
+                        kw=niche_kw,
+                        limit=limit,
+                        start_page=start_page,
+                        mode=mode,
+                        has_email_only=has_email_only,
+                        emit_fn=emit,
+                    )
+                    with results_lock:
+                        if res:
+                            niche_results.append(res)
+
+                futures = [executor.submit(task, kw, i) for i, kw in enumerate(clean_kws)]
+                for f in futures:
+                    try:
+                        f.result()
+                    except Exception as e:
+                        emit("error", message=f"Worker error: {e}")
+
+            current_leads = load_leads()
+            emit(
+                "bulk_done",
+                total_niches=len(clean_kws),
+                total_scraped=sum(r.get("scraped", 0) for r in niche_results),
+                total_with_email=sum(r.get("with_email", 0) for r in niche_results),
+                total_leads=len(current_leads),
+                leads=[l.model_dump() for l in current_leads],
+                message=f"Bulk discovery complete for {len(clean_kws)} niches!",
+            )
+            event_q.put(None)
+
+        bg_thread = threading.Thread(target=run_all_workers, daemon=True)
+        bg_thread.start()
+
+        while True:
+            item = event_q.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 
 @app.delete("/api/leads")
@@ -277,3 +440,4 @@ def delete_leads_endpoint(niche: str | None = None, delete_all: bool = False):
         "remaining_count": len(remaining),
         "leads": [l.model_dump() for l in remaining],
     }
+

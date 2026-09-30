@@ -95,7 +95,9 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["fast", "stealthy"], default=config.DEFAULT_FETCH_MODE,
                         help="Fetch mode: 'fast' (HTTP) or 'stealthy' (headless browser).")
     parser.add_argument("--url", help="Scrape a single URL ad hoc.")
-    parser.add_argument("--keyword", help="Discover candidate affiliate marketer sites for a niche keyword, then scrape them.")
+    parser.add_argument("--keyword", help="Discover candidate affiliate marketer sites for a single niche keyword, then scrape them.")
+    parser.add_argument("--keywords", help="Discover candidate affiliate marketer sites for multiple niche keywords (comma-separated or JSON list), running concurrently.")
+    parser.add_argument("--workers", type=int, default=8, help="Number of concurrent worker threads for bulk scraping (default: 8).")
     parser.add_argument("--limit", type=int, default=100, help="Max number of leads to collect per keyword (default: 100).")
     parser.add_argument("--start-page", type=int, default=3, dest="start_page",
                         help="Which DuckDuckGo result page to start from (default: 3, skips pages 1 & 2 to target small businesses).")
@@ -104,6 +106,43 @@ if __name__ == "__main__":
     if args.url:
         target_urls = [args.url]
         run(target_urls, mode=args.mode)
+    elif args.keywords:
+        import json
+        from concurrent.futures import ThreadPoolExecutor
+
+        raw = args.keywords.strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                kws = [str(k).strip() for k in json.loads(raw) if str(k).strip()]
+            except Exception:
+                kws = [k.strip() for k in raw.split(",") if k.strip()]
+        else:
+            kws = [k.strip() for k in raw.split(",") if k.strip()]
+
+        if not kws:
+            print("[ERROR] No valid keywords provided.")
+            sys.exit(1)
+
+        workers = min(len(kws), max(1, args.workers))
+        print(f"\n[BULK] Starting asynchronous bulk discovery for {len(kws)} niche(s) using {workers} concurrent worker(s)...")
+
+        def process_niche(kw):
+            print(f"\n▶ Discovering affiliate marketer blogs for niche: \"{kw}\" (limit: {args.limit}, starting from page {args.start_page}) ...")
+            discovered_urls = discover_by_niche(kw, limit=args.limit, start_page=args.start_page)
+            if not discovered_urls:
+                print(f"  [INFO] No new candidate URLs discovered for keyword \"{kw}\".")
+                return 0
+            print(f"  ✓ Discovered {len(discovered_urls)} candidate site(s) for \"{kw}\". Starting extraction...")
+            run(discovered_urls, mode=args.mode, source_keyword=kw)
+            return len(discovered_urls)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(process_niche, kw) for kw in kws]
+            for f in futures:
+                f.result()
+
+        print(f"\n[BULK COMPLETE] Finished processing {len(kws)} niches. Total leads stored: {len(load_leads())}")
+
     elif args.keyword:
         print(f"\nDiscovering affiliate marketer blogs for niche: \"{args.keyword}\" (limit: {args.limit}, starting from page {args.start_page}) ...")
         discovered_urls = discover_by_niche(args.keyword, limit=args.limit, start_page=args.start_page)
@@ -127,3 +166,4 @@ if __name__ == "__main__":
             )
             sys.exit(1)
         run(target_urls, mode=args.mode)
+

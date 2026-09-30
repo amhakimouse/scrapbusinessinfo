@@ -22,12 +22,16 @@ def test_cli_empty_seeds(tmp_path, monkeypatch):
 
 def test_cli_single_url_and_keyword_parsing():
     import main
-    # Ensure arg parsing handles --url, --keyword, --mode
+    # Ensure arg parsing handles --url, --keyword, --keywords, --workers, --mode
     parser = main.argparse.ArgumentParser()
     parser.add_argument("--mode", default="fast")
     parser.add_argument("--url")
     parser.add_argument("--keyword")
+    parser.add_argument("--keywords")
+    parser.add_argument("--workers", type=int, default=8)
 
-    args = parser.parse_args(["--keyword", "gardening tools", "--mode", "stealthy"])
-    assert args.keyword == "gardening tools"
+    args = parser.parse_args(["--keywords", "gardening tools, coffee makers", "--workers", "8", "--mode", "stealthy"])
+    assert args.keywords == "gardening tools, coffee makers"
+    assert args.workers == 8
     assert args.mode == "stealthy"
+

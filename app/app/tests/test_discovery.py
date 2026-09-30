@@ -48,18 +48,18 @@ def test_discover_by_niche_dedup_and_filter(monkeypatch):
     fake_results = {
         "best coffee review": [
             "https://coffeesite1.com/best-beans",
-            "https://coffeesite1.com/other-page",            # duplicate domain
+            "https://coffeesite1.com/other-page",            # duplicate domain — should be deduplicated
             "https://google.com/search",                      # excluded domain
             "https://healthline.com/nutrition/coffee",       # large publisher
             "https://sub.future.net.uk/coffee-reviews",       # media network parent
         ],
         "top coffee buying guide 2026": [
             "https://coffeesite2.com/reviews",
-            "https://existing.com/page",                      # already known lead
+            "https://existing.com/page",   # already in leads.json — NOT filtered (dedup at write via upsert_lead)
         ],
         '"coffee" review "as an amazon associate"': [
             "https://coffeesite3.com/blog",
-            "https://somebrand.com/pages/affiliate-program",  # program page filtered
+            "https://somebrand.com/pages/affiliate-program",  # program page — filtered
         ],
         "best coffee tested recommended blog": [
             "https://coffeesite4.com/tested",
@@ -70,20 +70,17 @@ def test_discover_by_niche_dedup_and_filter(monkeypatch):
         return fake_results.get(query, [])
 
     monkeypatch.setattr("scraper.discovery.search_candidate_urls", fake_search)
-    monkeypatch.setattr("scraper.store.load_leads", lambda: [
-        Lead(domain="existing.com", url="https://existing.com")
-    ])
 
     results = discover_by_niche("coffee")
     assert "https://coffeesite1.com/best-beans" in results
     assert "https://coffeesite2.com/reviews" in results
     assert "https://coffeesite3.com/blog" in results
     assert "https://coffeesite4.com/tested" in results
-    # Duplicate, program signup, large publishers, and excluded domains must not be in results
+    # Previously-scraped leads are now included so discovery works even with large leads.json
+    assert "https://existing.com/page" in results
+    # Duplicate same-domain page, program signup, excluded domains, and large publishers must still be filtered
     assert "https://coffeesite1.com/other-page" not in results
     assert "https://somebrand.com/pages/affiliate-program" not in results
     assert not any("google.com" in r for r in results)
-    assert not any("existing.com" in r for r in results)
     assert not any("healthline.com" in r for r in results)
     assert not any("future.net.uk" in r for r in results)
-
