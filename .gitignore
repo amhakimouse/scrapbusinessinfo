@@ -1,26 +1,45 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Environments
+# Environments & Secrets
 .env
+**/.env
 .venv
-env/
 venv/
+**/venv/
 ENV/
 env.bak/
 venv.bak/
 
-# Testing
+# Byte-compiled / cache files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
 .pytest_cache/
+**/.pytest_cache/
 .coverage
 htmlcov/
 .tox/
 
+# Scraped Data & Output
+data/leads.json
+**/data/leads.json
+
+# Frontend build artifacts & dependencies
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.vite/
+**/.vite/
+
+# OS / Windows WSL Zone Identifier metadata
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+*.Zone.Identifier
+*.Zone.Identifier:*
+
 # Logs
 *.log
 
-# OS
-.DS_Store
-Thumbs.db
+# Tooling compatibility alias
+app/app
